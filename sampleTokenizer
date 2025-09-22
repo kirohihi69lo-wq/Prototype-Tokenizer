@@ -1,0 +1,485 @@
+# MIT License - Simplified for PSS: Permission granted to use, copy, modify, distribute freely. No warranty.
+# HIROKI
+
+import array
+import collections
+import dataclasses
+import functools
+import hashlib
+import itertools
+import math
+import re
+import time
+import zlib
+from collections import defaultdict, namedtuple
+from dataclasses import dataclass, field, replace
+from functools import lru_cache, partial
+from itertools import chain, islice
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    Sequence,
+    Iterable,
+    Iterator,
+)
+
+Token = namedtuple("Token", ["type", "value", "line", "column", "meta"])
+
+
+@dataclass(frozen=True)
+class TokenMeta:
+    confidence: float = 1.0
+    alternatives: Optional[List[str]] = None
+    context: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+
+# PSS Primitives
+def vec(data: Iterable[Any], dtype: str = "i") -> array.array:
+    return array.array(dtype, data)
+
+
+def cast(data: Any, dtype: type) -> Any:
+    return dtype(data)
+
+
+def window(seq: Sequence[Any], k: int) -> Iterator[Tuple[Any, ...]]:
+    return (tuple(seq[i : i + k]) for i in range(len(seq) - k + 1))
+
+
+def windowed(seq: Sequence[Any], k: int, step: int = 1) -> Iterator[Tuple[Any, ...]]:
+    return (tuple(seq[i : i + k]) for i in range(0, len(seq) - k + 1, step))
+
+
+def chunk(seq: Iterable[Any], k: int) -> Iterator[List[Any]]:
+    it = iter(seq)
+    while True:
+        res = list(islice(it, k))
+        if not res:
+            break
+        yield res
+
+
+def flatten(seq: Iterable[Iterable[Any]]) -> List[Any]:
+    return list(chain.from_iterable(seq))
+
+
+def pad(seq: Sequence[Any], n: int, mode: str = "same", val: Any = 0) -> List[Any]:
+    if mode == "same":
+        left = (n - 1) // 2
+        right = n // 2
+        return [val] * left + list(seq) + [val] * right
+    return list(seq)
+
+
+def diff(seq: Sequence[float]) -> List[float]:
+    return [seq[i + 1] - seq[i] for i in range(len(seq) - 1)]
+
+
+def prefix_sum(seq: Sequence[float]) -> List[float]:
+    res = [0.0] * (len(seq) + 1)
+    for i in range(1, len(res)):
+        res[i] = res[i - 1] + seq[i - 1]
+    return res
+
+
+def take(seq: Iterable[Any], n: int) -> List[Any]:
+    return list(islice(seq, n))
+
+
+def drop(seq: Iterable[Any], n: int) -> List[Any]:
+    return list(islice(seq, n, None))
+
+
+def unique(seq: Sequence[Any]) -> List[Any]:
+    seen = set()
+    return [x for x in seq if not (x in seen or seen.add(x))]
+
+
+def topk(seq: Sequence[float], k: int) -> List[float]:
+    return sorted(seq, reverse=True)[:k]
+
+
+def argmin(seq: Sequence[float]) -> int:
+    return min(range(len(seq)), key=seq.__getitem__)
+
+
+def argmax(seq: Sequence[float]) -> int:
+    return max(range(len(seq)), key=seq.__getitem__)
+
+
+def partition(
+    seq: Sequence[Any], pred: Callable[[Any], bool]
+) -> Tuple[List[Any], List[Any]]:
+    true, false = [], []
+    for x in seq:
+        (true if pred(x) else false).append(x)
+    return true, false
+
+
+def sum_kahan(seq: Sequence[float]) -> float:
+    s = c = 0.0
+    for x in seq:
+        y = x - c
+        t = s + y
+        c = (t - s) - y
+        s = t
+    return s
+
+
+def mean(seq: Sequence[float]) -> float:
+    return sum_kahan(seq) / len(seq) if seq else 0.0
+
+
+def var(seq: Sequence[float]) -> float:
+    m = mean(seq)
+    return (
+        sum_kahan((x - m) ** 2 for x in seq) / (len(seq) - 1) if len(seq) > 1 else 0.0
+    )
+
+
+def median(seq: Sequence[float]) -> float:
+    s = sorted(seq)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def quantile(seq: Sequence[float], q: float) -> float:
+    s = sorted(seq)
+    i = int(q * (len(s) - 1))
+    return s[i]
+
+
+def softmax(seq: Sequence[float]) -> List[float]:
+    m = max(seq)
+    e = [math.exp(x - m) for x in seq]
+    s = sum_kahan(e)
+    return [x / s for x in e]
+
+
+def logsumexp(seq: Sequence[float]) -> float:
+    m = max(seq)
+    return m + math.log(sum_kahan(math.exp(x - m) for x in seq))
+
+
+def dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum_kahan(x * y for x, y in zip(a, b))
+
+
+def norm(seq: Sequence[float], p: float = 2.0) -> float:
+    return sum_kahan(abs(x) ** p for x in seq) ** (1 / p)
+
+
+def axpy(a: float, x: array.array, y: array.array) -> None:
+    for i in range(len(x)):
+        y[i] += a * x[i]
+
+
+def cross(
+    a: Tuple[float, float, float], b: Tuple[float, float, float]
+) -> Tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def bench(f: Callable, *args: Any, **kwargs: Any) -> float:
+    start = time.perf_counter()
+    f(*args, **kwargs)
+    return (time.perf_counter() - start) * 1000
+
+
+def time_ms() -> float:
+    return time.perf_counter() * 1000
+
+
+def validate(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ValueError(msg)
+
+
+def guard(pred: Callable[[Any], bool], f: Callable) -> Callable:
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if pred(*args, **kwargs):
+            return f(*args, **kwargs)
+        raise ValueError("Guard failed")
+
+    return wrapped
+
+
+def pipe(x: Any, *funcs: Callable) -> Any:
+    for f in funcs:
+        x = f(x)
+    return x
+
+
+def compose(*funcs: Callable) -> Callable:
+    def composed(x: Any) -> Any:
+        for f in reversed(funcs):
+            x = f(x)
+        return x
+
+    return composed
+
+
+class SonicBuffer:
+    def __init__(self, slots: int = 32):
+        self.slots: List[Optional[Tuple[Any, Any]]] = [None] * slots
+        self.idx: int = 0
+        self.hits: int = 0
+
+    def store(self, key: Any, value: Any) -> None:
+        self.slots[self.idx] = (key, value)
+        self.idx = (self.idx + 1) % len(self.slots)
+        self.hits += 1
+
+    def load(self, key: Any) -> Optional[Any]:
+        for slot in self.slots:
+            if slot is not None:
+                k, v = slot
+                if k == key:
+                    return v
+        return None
+
+
+class ProTokenizer:
+    """Advanced tokenizer for pro-use."""
+
+    def __init__(self, text: str) -> None:
+        validate(isinstance(text, str), "Input must be string")
+        self.text: str = text
+        self.pos: int = 0
+        self.line: int = 1
+        self.column: int = 1
+        self.tokens: List[Token] = []
+        self.keywords: set = {"if", "else", "while", "for", "return", "def", "class"}
+        self.patterns: List[Tuple[str, str]] = [
+            ("NUMBER", r"\d+(\.\d+)?([eE][+-]?\d+)?"),
+            ("IDENTIFIER", r"[\w\u0080-\U0010FFFF🆔-🆙]+"),
+            (
+                "STRING",
+                r'"([^"\\]*(\\.[^"\\]*)*)"|\'([^\'\\]*(\\.[^\'\\]*)*)\'|"""(.*?)"""|\'\'\'(.*?)\'\'\'',
+            ),
+            ("OPERATOR", r"[+\-*/%=&|!<>^~@#$?]+"),
+            ("SYMBOL", r"[(){}[\];,:.]"),
+            ("WHITESPACE", r"\s+"),
+            ("COMMENT", r"#.*|/\*(.*?)\*/|//.*"),
+            ("CUSTOM", r'[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>/?]+'),
+        ]
+        self.regex: re.Pattern = re.compile(
+            "|".join(f"(?P<{p[0]}>{p[1]})" for p in self.patterns),
+            re.UNICODE | re.DOTALL | re.MULTILINE,
+        )
+        self.trans_maps: Dict[str, Dict[str, str]] = {
+            "en-ja": {
+                "if": "もし",
+                "else": "それ以外",
+                "while": "ながら",
+                "for": "のために",
+                "return": "返す",
+                "def": "定義",
+                "class": "クラス",
+                "add": "追加",
+            },
+            "ja-en": {},
+        }
+        self.trans_maps["ja-en"] = {v: k for k, v in self.trans_maps["en-ja"].items()}
+        self.para_maps: Dict[str, List[str]] = {
+            "if": ["in case", "when", "provided that"],
+            "else": ["otherwise", "or else", "alternatively"],
+            "while": ["as long as", "during", "throughout"],
+            "for": ["over", "through", "across"],
+            "return": ["yield", "give back", "send back"],
+            "def": ["define", "function", "declare"],
+            "class": ["type", "category", "grouping"],
+        }
+        self.extensions: Dict[str, Callable] = {}
+        self.buffer: SonicBuffer = SonicBuffer(64)
+        self.metrics: Dict[str, float] = {}
+        self._prewarm()
+
+    def _prewarm(self) -> None:
+        dummy = "def test(): return 1 + 1"
+        dummy_tokens: List[Token] = []
+        for _ in range(100):
+            self.buffer.store(hash(dummy), dummy_tokens)
+
+    def register_extension(self, name: str, func: Callable) -> None:
+        validate(callable(func), "Extension must be callable")
+        self.extensions[name] = func
+
+    def tokenize(self, text: Optional[str] = None, recover: bool = True) -> List[Token]:
+        if text is not None:
+            self.text = text
+            self.pos = 0
+            self.line = 1
+            self.column = 1
+            self.tokens = []
+        start_time = time_ms()
+        key = hash(self.text)
+        cached = self.buffer.load(key)
+        if cached is not None:
+            self.tokens = cached
+            self.metrics["jit_hit"] = 1.0
+        else:
+            while self.pos < len(self.text):
+                match = self.regex.match(self.text, self.pos)
+                if not match:
+                    if recover:
+                        self._recover_invalid()
+                        continue
+                    raise ValueError(f"Invalid at L{self.line}:C{self.column}")
+                token_type = next(t for t in match.groupdict() if match.group(t))
+                value = match.group(token_type)
+                if token_type in {"WHITESPACE", "COMMENT"}:
+                    self._update_position(value)
+                    continue
+                if token_type == "IDENTIFIER" and value in self.keywords:
+                    token_type = "KEYWORD"
+                meta = self._compute_meta(token_type, value)
+                for ext in self.extensions.values():
+                    out = ext(token_type, value, meta)
+                    if out:
+                        value, meta = out
+                self.tokens.append(
+                    Token(token_type, value, self.line, self.column, meta)
+                )
+                self._update_position(value)
+            self.buffer.store(key, self.tokens[:])
+            self.metrics["jit_hit"] = 0.0
+        self.metrics["p95_ms"] = time_ms() - start_time
+        return self.tokens
+
+    def _update_position(self, value: str) -> None:
+        lines = value.split("\n")
+        if len(lines) > 1:
+            self.line += len(lines) - 1
+            self.column = len(lines[-1]) + 1
+        else:
+            self.column += len(value)
+        self.pos += len(value)
+
+    def _recover_invalid(self) -> None:
+        char = self.text[self.pos]
+        meta = TokenMeta(0.5, [char], {"error": "recovered"})
+        self.tokens.append(Token("ERROR", char, self.line, self.column, meta))
+        self._update_position(char)
+
+    @lru_cache(maxsize=2048)
+    def _compute_meta(self, token_type: str, value: str) -> TokenMeta:
+        conf = 1.0 if token_type != "CUSTOM" else 0.8
+        alts = self.para_maps.get(value)
+        ctx = {"length": len(value), "hash": zlib.crc32(value.encode()) & 0xFFFFFFFF}
+        return TokenMeta(conf, alts, ctx)
+
+    def translate_tokens(self, lang_pair: str = "en-ja") -> List[Token]:
+        mapping = self.trans_maps.get(lang_pair, {})
+        return [
+            Token(
+                t.type,
+                mapping.get(t.value, t.value),
+                t.line,
+                t.column,
+                replace(t.meta, alternatives=[t.value]),
+            )
+            for t in self.tokens
+        ]
+
+    def paraphrase_tokens(self, level: int = 1) -> List[Token]:
+        return [
+            Token(
+                t.type,
+                (
+                    alts := (
+                        t.meta.alternatives or self.para_maps.get(t.value, [t.value])
+                    )
+                )[level % len(alts)],
+                t.line,
+                t.column,
+                replace(t.meta, confidence=0.9),
+            )
+            for t in self.tokens
+        ]
+
+    def reconstruct_text(self, tokens: Optional[List[Token]] = None) -> str:
+        tokens = tokens or self.tokens
+        parts: List[str] = []
+        prev_line, prev_col = 1, 1
+        for t in tokens:
+            while prev_line < t.line:
+                parts.append("\n")
+                prev_line += 1
+                prev_col = 1
+            while prev_col < t.column:
+                parts.append(" ")
+                prev_col += 1
+            if t.type == "CUSTOM":
+                parts.append(f"/*{t.value}*/")
+            else:
+                parts.append(t.value)
+            prev_col += len(t.value)
+        return "".join(parts)
+
+    def analyze_context(self) -> Dict[str, int]:
+        counts = defaultdict(int)
+        for t in self.tokens:
+            counts[t.type] += 1
+        return dict(counts)
+
+    def metrics_snapshot(self) -> Dict[str, float]:
+        return self.metrics.copy()
+
+
+def tokenize_text(text: str, recover: bool = True) -> List[Token]:
+    tokenizer = ProTokenizer(text)
+    return tokenizer.tokenize(recover=recover)
+
+
+def translate_text(text: str, lang_pair: str = "en-ja") -> str:
+    tokenizer = ProTokenizer(text)
+    tokenizer.tokenize()
+    return tokenizer.reconstruct_text(tokenizer.translate_tokens(lang_pair))
+
+
+def paraphrase_text(text: str, level: int = 1) -> str:
+    tokenizer = ProTokenizer(text)
+    tokenizer.tokenize()
+    return tokenizer.reconstruct_text(tokenizer.paraphrase_tokens(level))
+
+
+def extend_syntax(tokenizer: ProTokenizer) -> None:
+    def custom_wrap(tok_type: str, value: str, meta: TokenMeta):
+        if tok_type in ("IDENTIFIER", "STRING") and meta.context.get("length", 0) > 5:
+            return f"<{value}>", replace(meta, confidence=0.95)
+        return None
+
+    tokenizer.register_extension("wrap_long", custom_wrap)
+
+
+if __name__ == "__main__":
+    sample: str = """
+def add(a, b):
+    return a + b  # Simple addition
+"""
+    tokenizer: ProTokenizer = ProTokenizer(sample)
+    extend_syntax(tokenizer)
+    tokens: List[Token] = tokenizer.tokenize()
+    print("Pro Tokens:")
+    for token in tokens:
+        print(token)
+    trans_text: str = tokenizer.reconstruct_text(tokenizer.translate_tokens("en-ja"))
+    print("\nPro Translated:")
+    print(trans_text)
+    para_text: str = tokenizer.reconstruct_text(tokenizer.paraphrase_tokens(2))
+    print("\nPro Paraphrased:")
+    print(para_text)
+    print("\nContext Analysis:")
+    print(tokenizer.analyze_context())
+    print("\nMetrics:")
+    print(tokenizer.metrics_snapshot())
